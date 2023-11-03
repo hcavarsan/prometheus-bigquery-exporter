@@ -49,7 +49,7 @@ func (f *File) IsModified() (bool, error) {
 // Register the given collector. If a collector was previously registered with
 // this file, then it is unregistered first. If either registration or
 // unregister fails, then the error is returned.
-func (f *File) Register(queryRunner sql.QueryRunner) error {
+func (f *File) Register(c *sql.Collector) error {
 	if f.c != nil {
 		ok := prometheus.Unregister(f.c)
 		logx.Debug.Println("Unregister:", ok)
@@ -58,8 +58,6 @@ func (f *File) Register(queryRunner sql.QueryRunner) error {
 		}
 		f.c = nil
 	}
-
-	c := sql.NewCollector(queryRunner, prometheus.GaugeValue, f.Name, "your_query_here") // Add appropriate arguments here
 
 	err := prometheus.Register(c)
 	if err != nil {
