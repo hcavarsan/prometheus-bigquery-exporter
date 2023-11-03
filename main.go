@@ -1,10 +1,14 @@
+// bigquery_exporter runs structured bigquery SQL and converts the results into
+// prometheus metrics. bigquery_exporter can process multiple queries.
+// Because BigQuery queries can have long run times and high cost, Query results
+// are cached and updated every refresh interval, not on every scrape of
+// prometheus metrics.
 package main
 
 import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -32,17 +36,22 @@ var (
 )
 
 func init() {
+	// TODO: support counter queries.
+	// flag.Var(&counterSources, "counter-query", "Name of file containing a counter query.")
 	flag.Var(&gaugeSources, "gauge-query", "Name of file containing a gauge query.")
+	// Port registered at https://github.com/prometheus/prometheus/wiki/Default-port-allocations
 	*prometheusx.ListenAddress = ":9348"
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }
 
+// sleepUntilNext finds the nearest future time that is a multiple of the given
+// duration and sleeps until that time.
 func sleepUntilNext(d time.Duration) {
 	next := time.Now().Truncate(d).Add(d)
 	time.Sleep(time.Until(next))
 }
 
-// Updated function for handling metric name and corresponding query extraction.
+// fileToMetric extracts metrics and queries from the file contents.
 func fileToMetrics(filename string) (map[string]string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -85,27 +94,6 @@ func fileToMetrics(filename string) (map[string]string, error) {
 	return metrics, nil
 }
 
-func fileToQueries(filename string, vars map[string]string) []string {
-	queryBytes, err := ioutil.ReadFile(filename)
-	rtx.Must(err, "Failed to open %q", filename)
-	queriesString := strings.Split(string(queryBytes), ";")
-
-	var queries []string
-	for _, q := range queriesString {
-		q = strings.TrimSpace(q)
-
-		if len(q) > 0 {
-			q = strings.Replace(q, "UNIX_START_TIME", vars["UNIX_START_TIME"], -1)
-			q = strings.Replace(q, "REFRESH_RATE_SEC", vars["REFRESH_RATE_SEC"], -1)
-
-			queries = append(queries, q)
-			log.Println(queries)
-		}
-	}
-
-	return queries
-}
-
 func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, vars map[string]string) {
 	var wg sync.WaitGroup
 	// Define and initialize a metric registry
@@ -132,7 +120,6 @@ func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, vars map[
 				for metricName, query := range metrics {
 					// Register only if the metric has not been registered yet.
 					if !metricRegistry[metricName] {
-						log.Println("Preparing to register:", metricName, "WITH", query)
 						c := sql.NewCollector(
 							newRunner(client), prometheus.GaugeValue,
 							metricName, query) // Using the specific query for this metric.
@@ -140,19 +127,21 @@ func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, vars map[
 						if err != nil {
 							log.Println("Failed to register collector for", metricName, ":", err)
 						} else {
-							log.Println("Successfully registered:", metricName)
+							log.Println("Registering:", metricName)
 							metricRegistry[metricName] = true
 						}
 					}
 				}
 			} else {
-				start := time.Now()
-				err = f.Update()
-				if err != nil {
-					log.Println("Error:", f.Name, "Failed to update:", err)
-				} else {
-					log.Println("Updating:", time.Since(start))
+				metrics, _ := fileToMetrics(f.Name)
+				for metricName := range metrics {
+					start := time.Now()
+					err = f.Update()
+					log.Println("Updating:", metricName, time.Since(start))
 				}
+			}
+			if err != nil {
+				log.Println("Error:", f.Name, err)
 			}
 		}(&files[i])
 	}

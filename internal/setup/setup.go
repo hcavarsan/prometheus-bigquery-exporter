@@ -54,17 +54,19 @@ func (f *File) Register(c *sql.Collector) error {
 		ok := prometheus.Unregister(f.c)
 		logx.Debug.Println("Unregister:", ok)
 		if !ok {
+			// This is a fatal error. If the
 			return fmt.Errorf("failed to unregister %q", f.Name)
 		}
 		f.c = nil
 	}
-
+	// Register runs c.Update().
 	err := prometheus.Register(c)
 	if err != nil {
+		// While collector Update could fail transiently, this may be a fatal error.
 		return err
 	}
 	logx.Debug.Println("Register:", f.Name, c.RegisterErr)
-
+	// Save the registered collector.
 	f.c = c
 	return c.RegisterErr
 }

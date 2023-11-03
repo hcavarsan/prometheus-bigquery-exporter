@@ -99,6 +99,7 @@ func (col *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	col.mux.Lock()
+	// Get reference to current metrics slice to allow Update to run concurrently.
 	metrics := col.metrics
 	col.mux.Unlock()
 
