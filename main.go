@@ -6,11 +6,10 @@
 package main
 
 import (
+	"bufio"
 	"flag"
-	"fmt"
-	"io/ioutil"
 	"log"
-	"path/filepath"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +38,6 @@ func init() {
 	// TODO: support counter queries.
 	// flag.Var(&counterSources, "counter-query", "Name of file containing a counter query.")
 	flag.Var(&gaugeSources, "gauge-query", "Name of file containing a gauge query.")
-
 	// Port registered at https://github.com/prometheus/prometheus/wiki/Default-port-allocations
 	*prometheusx.ListenAddress = ":9348"
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -52,49 +50,91 @@ func sleepUntilNext(d time.Duration) {
 	time.Sleep(time.Until(next))
 }
 
-// fileToMetric extracts the base file name to use as a prometheus metric name.
-func fileToMetric(filename string) string {
-	fname := filepath.Base(filename)
-	return strings.TrimSuffix(fname, filepath.Ext(fname))
+// fileToMetric extracts metrics and queries from the file contents.
+func fileToMetrics(filename string) (map[string]string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	currentMetric := ""
+	metrics := make(map[string]string)
+	var currentQuery strings.Builder
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Ignore comments
+		if strings.HasPrefix(line, "--") && !strings.HasPrefix(line, "-- MetricName:") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "-- MetricName:") {
+			currentMetric = strings.TrimPrefix(line, "-- MetricName:")
+			currentMetric = strings.TrimSpace(currentMetric)
+		} else if len(line) > 0 && line != "" {
+			// append a space at the end of line
+			currentQuery.WriteString(line + " ")
+
+			if strings.HasSuffix(line, ";") {
+				metrics[currentMetric] = currentQuery.String()
+				currentMetric = ""
+				currentQuery.Reset()
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return metrics, nil
 }
 
-// fileToQuery reads the content of the given file and returns the query with template values repalced with those in vars.
-func fileToQuery(filename string, vars map[string]string) string {
-	queryBytes, err := ioutil.ReadFile(filename)
-	rtx.Must(err, "Failed to open %q", filename)
-
-	q := string(queryBytes)
-	q = strings.Replace(q, "UNIX_START_TIME", vars["UNIX_START_TIME"], -1)
-	q = strings.Replace(q, "REFRESH_RATE_SEC", vars["REFRESH_RATE_SEC"], -1)
-	return q
-}
-
-func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, vars map[string]string) {
+func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, refresh time.Duration) {
 	var wg sync.WaitGroup
+	// Define and initialize a metric registry
+	metricRegistry := make(map[string]bool)
+	metricRegistryMutex := &sync.Mutex{}
+
 	for i := range files {
 		wg.Add(1)
 		go func(f *setup.File) {
+			defer wg.Done()
 			modified, err := f.IsModified()
-			if modified && err == nil {
-				c := sql.NewCollector(
-					newRunner(client), prometheus.GaugeValue,
-					fileToMetric(f.Name), fileToQuery(f.Name, vars))
-
-				log.Println("Registering:", fileToMetric(f.Name))
-				// NOTE: prometheus collector registration will fail when a file
-				// uses the same name but changes the metrics reported. Because
-				// this cannot be recovered, we use rtx.Must to exit and allow
-				// the runtime environment to restart.
-				rtx.Must(f.Register(c), "Failed to register collector: aborting")
-			} else {
-				start := time.Now()
-				err = f.Update()
-				log.Println("Updating:", fileToMetric(f.Name), time.Since(start))
-			}
 			if err != nil {
-				log.Println("Error:", f.Name, err)
+				log.Println("Error:", f.Name, "Failed to check if file is modified:", err)
+				return
 			}
-			wg.Done()
+
+			metrics, err := fileToMetrics(f.Name)
+			if err != nil {
+				log.Println("Error:", f.Name, "Failed to process metrics:", err)
+				return
+			}
+
+			if modified {
+				for metricName, query := range metrics {
+					metricRegistryMutex.Lock()
+					if !metricRegistry[metricName] {
+						c := sql.NewCollector(
+							newRunner(client), prometheus.GaugeValue,
+							metricName, query,
+						)
+						err := prometheus.Register(c)
+						if err != nil {
+							log.Println("Failed to register collector for", metricName, ":", err)
+						} else {
+							log.Println("Registering:", metricName)
+							metricRegistry[metricName] = true
+							c.StartUpdatingMetrics(refresh)
+
+						}
+					}
+					metricRegistryMutex.Unlock()
+				}
+			}
 		}(&files[i])
 	}
 	wg.Wait()
@@ -119,13 +159,8 @@ func main() {
 
 	client, err := bigquery.NewClient(mainCtx, *project)
 	rtx.Must(err, "Failed to allocate a new bigquery.Client")
-	vars := map[string]string{
-		"UNIX_START_TIME":  fmt.Sprintf("%d", time.Now().UTC().Unix()),
-		"REFRESH_RATE_SEC": fmt.Sprintf("%d", int(refresh.Seconds())),
-	}
-
 	for mainCtx.Err() == nil {
-		reloadRegisterUpdate(client, files, vars)
+		reloadRegisterUpdate(client, files, *refresh)
 		sleepUntilNext(*refresh)
 	}
 }

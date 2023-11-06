@@ -93,12 +93,17 @@ func (col *Collector) Describe(ch chan<- *prometheus.Desc) {
 // from cached metrics.
 func (col *Collector) Collect(ch chan<- prometheus.Metric) {
 	logx.Debug.Println("Collect:", time.Now())
+	if err := col.Update(); err != nil {
+		log.Println("Error updating metrics :", err)
+		return
+	}
+
 	col.mux.Lock()
 	// Get reference to current metrics slice to allow Update to run concurrently.
 	metrics := col.metrics
 	col.mux.Unlock()
 
-	for i := range col.metrics {
+	for i := range metrics {
 		for k, desc := range col.descs {
 			logx.Debug.Printf("%s labels:%#v values:%#v",
 				col.metricName, metrics[i].LabelValues, metrics[i].Values[k])
@@ -122,6 +127,9 @@ func (col *Collector) Update() error {
 		logx.Debug.Println("Failed to run query:", err)
 		return err
 	}
+
+	// Debugging - print number of metrics obtained
+	logx.Debug.Printf("Obtained %d metrics", len(metrics))
 	// Swap the cached metrics.
 	col.mux.Lock()
 	defer col.mux.Unlock()
@@ -132,11 +140,28 @@ func (col *Collector) Update() error {
 }
 
 func (col *Collector) setDesc() {
-	// The query may return no results.
-	if len(col.metrics) > 0 {
-		for k := range col.metrics[0].Values {
-			// TODO: allow passing meaningful help text.
-			col.descs[k] = prometheus.NewDesc(col.metricName+k, "help text", col.metrics[0].LabelKeys, nil)
+	// For each metric in the collection,
+	for _, metric := range col.metrics {
+		// If the metric has values,
+		if len(metric.Values) > 0 {
+			// For each key in the Values map of the metric,
+			for k := range metric.Values {
+				// Create a new Desc for the key and store it in the descs map.
+				col.descs[k] = prometheus.NewDesc(col.metricName+k, "help text", metric.LabelKeys, nil)
+			}
 		}
 	}
+}
+
+func (col *Collector) StartUpdatingMetrics(interval time.Duration) {
+	go func() {
+		for {
+			time.Sleep(interval)
+			err := col.Update()
+			log.Println("Updated metrics:", col.metricName)
+			if err != nil {
+				log.Println("Error updating metrics:", err)
+			}
+		}
+	}()
 }
