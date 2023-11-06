@@ -152,3 +152,16 @@ func (col *Collector) setDesc() {
 		}
 	}
 }
+
+func (col *Collector) StartUpdatingMetrics(interval time.Duration) {
+	go func() {
+		for {
+			time.Sleep(interval)
+			err := col.Update()
+			log.Println("Updated metrics:", col.metricName)
+			if err != nil {
+				log.Println("Error updating metrics:", err)
+			}
+		}
+	}()
+}

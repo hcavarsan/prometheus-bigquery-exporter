@@ -8,7 +8,6 @@ package main
 import (
 	"bufio"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -90,14 +89,14 @@ func fileToMetrics(filename string) (map[string]string, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-
 	return metrics, nil
 }
 
-func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, vars map[string]string) {
+func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, refresh time.Duration) {
 	var wg sync.WaitGroup
 	// Define and initialize a metric registry
 	metricRegistry := make(map[string]bool)
+	metricRegistryMutex := &sync.Mutex{}
 
 	for i := range files {
 		wg.Add(1)
@@ -109,39 +108,32 @@ func reloadRegisterUpdate(client *bigquery.Client, files []setup.File, vars map[
 				return
 			}
 
-			if modified {
-				// Extract metrics and queries from the file contents.
-				metrics, err := fileToMetrics(f.Name)
-				if err != nil {
-					log.Println("Error:", f.Name, "Failed to process metrics:", err)
-					return
-				}
+			metrics, err := fileToMetrics(f.Name)
+			if err != nil {
+				log.Println("Error:", f.Name, "Failed to process metrics:", err)
+				return
+			}
 
+			if modified {
 				for metricName, query := range metrics {
-					// Register only if the metric has not been registered yet.
+					metricRegistryMutex.Lock()
 					if !metricRegistry[metricName] {
 						c := sql.NewCollector(
 							newRunner(client), prometheus.GaugeValue,
-							metricName, query) // Using the specific query for this metric.
+							metricName, query,
+						)
 						err := prometheus.Register(c)
 						if err != nil {
 							log.Println("Failed to register collector for", metricName, ":", err)
 						} else {
 							log.Println("Registering:", metricName)
 							metricRegistry[metricName] = true
+							c.StartUpdatingMetrics(refresh)
+
 						}
 					}
+					metricRegistryMutex.Unlock()
 				}
-			} else {
-				metrics, _ := fileToMetrics(f.Name)
-				for metricName := range metrics {
-					start := time.Now()
-					err = f.Update()
-					log.Println("Updating:", metricName, time.Since(start))
-				}
-			}
-			if err != nil {
-				log.Println("Error:", f.Name, err)
 			}
 		}(&files[i])
 	}
@@ -167,13 +159,8 @@ func main() {
 
 	client, err := bigquery.NewClient(mainCtx, *project)
 	rtx.Must(err, "Failed to allocate a new bigquery.Client")
-	vars := map[string]string{
-		"UNIX_START_TIME":  fmt.Sprintf("%d", time.Now().UTC().Unix()),
-		"REFRESH_RATE_SEC": fmt.Sprintf("%d", int(refresh.Seconds())),
-	}
-
 	for mainCtx.Err() == nil {
-		reloadRegisterUpdate(client, files, vars)
+		reloadRegisterUpdate(client, files, *refresh)
 		sleepUntilNext(*refresh)
 	}
 }
